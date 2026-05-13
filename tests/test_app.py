@@ -1,4 +1,5 @@
 import base64
+from io import BytesIO
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -16,6 +17,11 @@ def _file_base64(name: str) -> str:
 
 def _file_base64_by_size(size: int) -> str:
     path = next(item for item in ROOT.glob("*.docx") if item.stat().st_size == size)
+    return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def _image_base64_by_size(size: int) -> str:
+    path = next(item for item in ROOT.iterdir() if item.is_file() and item.stat().st_size == size)
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
@@ -49,6 +55,107 @@ def test_mcp_tools_are_exposed():
     assert "check_completeness" in names
 
 
+def test_knowledge_upload_should_add_chunk_points_and_similarity_edges():
+    content = "\n\n".join(
+        [
+            f"第{index}条：取水许可申请材料应包含申请书、身份证、营业执照。"
+            f"取水地点、申请期限、取水用途和第三方影响说明均需要审核。"
+            for index in range(1, 9)
+        ]
+    )
+    resp = client.post(
+        "/api/ai/knowledge/upload",
+        files={"file": ("课堂规则-可视化.md", BytesIO(content.encode("utf-8")), "text/markdown")},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["filename"] == "课堂规则-可视化.md"
+    assert data["chunksAdded"] >= 3
+    assert data["totalVectors"] >= data["chunksAdded"]
+    assert "取水许可申请材料" in data["preview"]
+
+    vectors_resp = client.get("/api/ai/knowledge/vectors")
+    assert vectors_resp.status_code == 200
+    vectors = vectors_resp.json()
+    assert vectors["total"] >= data["chunksAdded"]
+    uploaded_points = [point for point in vectors["points"] if point["source"] == "课堂规则-可视化.md"]
+    assert len(uploaded_points) >= data["chunksAdded"]
+    assert all(isinstance(point["chunk"], int) for point in uploaded_points)
+    assert all("docId" in point for point in uploaded_points)
+    assert len({(round(point["x"], 6), round(point["y"], 6)) for point in uploaded_points}) > 1
+    assert "edges" in vectors
+    assert any(edge["source"] == "课堂规则-可视化.md" for edge in vectors["edges"])
+
+
+def test_knowledge_documents_should_list_and_delete_uploaded_document():
+    filename = "课堂规则.md"
+    content = "\n\n".join(
+        [
+            f"第{index}条：取水许可申请材料应包含申请书、身份证、营业执照。"
+            f"申请期限、取水地点、取水用途和第三方影响说明均需要审核。"
+            for index in range(1, 9)
+        ]
+    )
+    upload_resp = client.post(
+        "/api/ai/knowledge/upload",
+        files={"file": (filename, BytesIO(content.encode("utf-8")), "text/markdown")},
+    )
+    assert upload_resp.status_code == 200
+    upload_data = upload_resp.json()
+    assert upload_data["filename"] == filename
+    assert upload_data["docId"]
+    assert upload_data["chunksAdded"] >= 3
+
+    documents_resp = client.get("/api/ai/knowledge/documents")
+    assert documents_resp.status_code == 200
+    documents = documents_resp.json()["documents"]
+    target = next((item for item in documents if item["docId"] == upload_data["docId"]), None)
+    assert target is not None
+    assert target["filename"] == filename
+    assert target["source"] == filename
+    assert target["chunks"] == upload_data["chunksAdded"]
+    assert target["deletable"] is True
+    assert "取水许可申请材料" in target["preview"]
+
+    delete_resp = client.delete(f"/api/ai/knowledge/documents/{upload_data['docId']}")
+    assert delete_resp.status_code == 200
+    delete_data = delete_resp.json()
+    assert delete_data["deleted"] is True
+    assert delete_data["deletedChunks"] == upload_data["chunksAdded"]
+
+    vectors_resp = client.get("/api/ai/knowledge/vectors")
+    assert vectors_resp.status_code == 200
+    assert all(point["docId"] != upload_data["docId"] for point in vectors_resp.json()["points"])
+
+    documents_after = client.get("/api/ai/knowledge/documents").json()["documents"]
+    assert all(item["docId"] != upload_data["docId"] for item in documents_after)
+
+
+def test_knowledge_docx_upload_should_return_complete_parsed_text():
+    path = ROOT / "取水许可办理需资料及流程.docx"
+    resp = client.post(
+        "/api/ai/knowledge/upload",
+        files={
+            "file": (
+                path.name,
+                BytesIO(path.read_bytes()),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["filename"] == path.name
+    assert data["parser"] == "docx-xml"
+    assert data["contentLength"] > len(data["preview"])
+    assert "根据《中华人民共和国水法》" in data["contentText"]
+    assert "报告书" in data["contentText"]
+    assert "报告表" in data["contentText"]
+
+    delete_resp = client.delete(f"/api/ai/knowledge/documents/{data['docId']}")
+    assert delete_resp.status_code == 200
+
+
 def test_extract_should_return_draft_and_attachment_summary(monkeypatch):
     monkeypatch.setattr("app.agent.ENABLE_REMOTE_AI_REVIEW", False)
 
@@ -76,10 +183,38 @@ def test_extract_should_return_draft_and_attachment_summary(monkeypatch):
     resp = client.post("/api/ai/extract", json=payload)
     assert resp.status_code == 200
     data = resp.json()
-    assert data["applicantName"] == "张三"
-    assert data["idNumber"] == "330102199901011234"
+    assert data["applicantName"] == "金阳"
+    assert data["idNumber"] == "110102197810272321"
+    assert data["licenseLegalRepresentative"] == "姜丹丹"
     assert any(item["filename"] == "身份证.jpg" for item in data["attachmentSummaries"])
     assert "身份证" in data["materials"]
+
+
+def test_extract_should_ocr_new_business_license_png(monkeypatch):
+    monkeypatch.setattr("app.agent.ENABLE_REMOTE_AI_REVIEW", False)
+
+    payload = {
+        "attachments": [
+            {
+                "docType": "business_license",
+                "filename": "营业执照未过期.png",
+                "mimeType": "image/png",
+                "size": 1957719,
+                "contentText": "",
+                "base64Content": _image_base64_by_size(1957719),
+            }
+        ]
+    }
+
+    resp = client.post("/api/ai/extract", json=payload)
+    assert resp.status_code == 200
+    data = resp.json()
+    summary = data["attachmentSummaries"][0]
+    assert data["licenseLegalRepresentative"] == "姜丹丹"
+    assert "营业执照" in summary["extractedText"]
+    assert "91441303MA531L6K37" in summary["extractedText"]
+    assert summary["extractedFields"]["companyName"] == "惠州市安建诚表面处理材料有限公司"
+    assert summary["warnings"] == []
 
 
 def test_extract_should_parse_application_docx_table_template(monkeypatch):
@@ -343,7 +478,7 @@ def test_precheck_should_detect_driver_license_renamed_as_id_card(monkeypatch):
     assert any("实际识别为驾驶证" in issue for issue in data["issues"])
 
 
-def test_precheck_should_detect_expired_business_license_from_uploaded_file(monkeypatch):
+def test_precheck_should_detect_expired_business_license_from_text_content(monkeypatch):
     monkeypatch.setattr("app.agent.ENABLE_REMOTE_AI_REVIEW", False)
 
     payload = {
@@ -362,10 +497,7 @@ def test_precheck_should_detect_expired_business_license_from_uploaded_file(monk
             {
                 "docType": "business_license",
                 "filename": "营业执照.jpg",
-                "mimeType": "image/jpeg",
-                "size": 100,
-                "contentText": "",
-                "base64Content": _file_base64("营业执照.jpg"),
+                "contentText": "营业执照 名称 杭州取水科技有限公司 法定代表人 王五 营业期限 2018-05-01 至 2024-05-01",
             }
         ],
     }

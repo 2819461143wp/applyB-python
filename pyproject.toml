@@ -12,11 +12,18 @@ dependencies = [
     "langchain==0.3.13",
     "python-multipart==0.0.20",
     "httpx==0.28.1",
+    "numpy==1.26.4",
+    "Pillow==11.3.0",
+    "opencv-python==4.10.0.84",
+    "rapidocr-onnxruntime==1.4.4",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest==8.3.4",
+]
+mineru = [
+    "mineru",
 ]
 
 [tool.pytest.ini_options]

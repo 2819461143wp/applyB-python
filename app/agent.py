@@ -6,7 +6,6 @@ import re
 import zipfile
 from base64 import b64decode
 from datetime import date, datetime
-from hashlib import sha256
 from io import BytesIO
 from typing import Any
 from xml.etree import ElementTree
@@ -21,20 +20,7 @@ ENABLE_REMOTE_AI_REVIEW = True
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY", "")
 MODELSCOPE_BASE_URL = "https://api-inference.modelscope.cn/v1/chat/completions"
 MODELSCOPE_MODEL = "THUDM/GLM-4-9B-Chat"
-KNOWN_SAMPLE_ATTACHMENTS: dict[str, dict[str, str]] = {
-    "F0C36252D8A6DBEDCFF2EB6D8E92C7F8A0A7744880D91A673ACF68EE220427EC": {
-        "kind": "id_card",
-        "text": "中华人民共和国居民身份证 姓名 张三 公民身份号码 330102199901011234 有效期限 2020.01.01-2040.01.01",
-    },
-    "C7C5D6BC954060301167040744F61A598930834B7F11F47C2D3BB23A8FEE3254": {
-        "kind": "business_license",
-        "text": "营业执照 名称 杭州取水科技有限公司 法定代表人 王五 营业期限 2018-05-01 至 2024-05-01",
-    },
-    "881BDEBFA105781A68E2E21837B9E44C957BE4C6AFEBCCA49D32F041C9541D2F": {
-        "kind": "driver_license",
-        "text": "中华人民共和国机动车驾驶证 姓名 张三 证号 330102199901011234 准驾车型 C1 有效期限 2020-01-01至2026-01-01",
-    },
-}
+_OCR_ENGINE: Any | None = None
 
 
 def _is_env_flag_on(name: str, default: bool = False) -> bool:
@@ -207,6 +193,36 @@ def _extract_text_from_plain_bytes(content: bytes) -> str:
     return ""
 
 
+def _get_ocr_engine() -> Any | None:
+    global _OCR_ENGINE
+    if _OCR_ENGINE is not None:
+        return _OCR_ENGINE
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except Exception:
+        return None
+    _OCR_ENGINE = RapidOCR()
+    return _OCR_ENGINE
+
+
+def _extract_text_from_image_bytes(content: bytes) -> str:
+    engine = _get_ocr_engine()
+    if engine is None:
+        return ""
+    try:
+        from PIL import Image
+        import numpy as np
+
+        image = Image.open(BytesIO(content)).convert("RGB")
+        result, _ = engine(np.array(image))
+    except Exception:
+        return ""
+    if not result:
+        return ""
+    lines = [str(item[1]).strip() for item in result if len(item) >= 2 and str(item[1]).strip()]
+    return "\n".join(lines)
+
+
 def _normalize_doc_kind(filename: str, doc_type: str) -> str:
     lower = filename.lower()
     normalized = doc_type.strip().lower()
@@ -223,10 +239,26 @@ def _normalize_doc_kind(filename: str, doc_type: str) -> str:
     return "unknown"
 
 
+def _detect_doc_kind_from_text(text: str, fallback: str) -> str:
+    compact = re.sub(r"\s+", "", text)
+    if "取水许可申请书" in compact:
+        return "application_form"
+    if "机动车驾驶证" in compact or "驾驶证" in compact:
+        return "driver_license"
+    if "营业执照" in compact or (
+        fallback == "business_license" and "统一社会信用代码" in compact and "法定代表人" in compact
+    ):
+        return "business_license"
+    if "居民身份证" in compact or "公民身份号码" in compact:
+        return "id_card"
+    return fallback
+
+
 def _extract_attachment_text(item: AttachmentInput) -> tuple[str, str]:
     inline_text = item.contentText.strip()
     if inline_text:
-        return inline_text, _normalize_doc_kind(item.filename, item.docType)
+        fallback_kind = _normalize_doc_kind(item.filename, item.docType)
+        return inline_text, _detect_doc_kind_from_text(inline_text, fallback_kind)
 
     if not item.base64Content.strip():
         return "", _normalize_doc_kind(item.filename, item.docType)
@@ -236,21 +268,23 @@ def _extract_attachment_text(item: AttachmentInput) -> tuple[str, str]:
     except Exception:
         return "", _normalize_doc_kind(item.filename, item.docType)
 
-    content_hash = sha256(content).hexdigest().upper()
-    if content_hash in KNOWN_SAMPLE_ATTACHMENTS:
-        sample = KNOWN_SAMPLE_ATTACHMENTS[content_hash]
-        return sample["text"], sample["kind"]
-
     filename = item.filename.lower()
     mime_type = item.mimeType.lower()
+    fallback_kind = _normalize_doc_kind(item.filename, item.docType)
     if filename.endswith(".docx") or "word" in mime_type:
-        return _extract_text_from_docx_bytes(content), _normalize_doc_kind(item.filename, item.docType)
+        text = _extract_text_from_docx_bytes(content)
+        return text, _detect_doc_kind_from_text(text, fallback_kind)
     if filename.endswith(".pdf") or "pdf" in mime_type:
-        return _extract_text_from_pdf_bytes(content), _normalize_doc_kind(item.filename, item.docType)
+        text = _extract_text_from_pdf_bytes(content)
+        return text, _detect_doc_kind_from_text(text, fallback_kind)
     if filename.endswith((".txt", ".md")) or mime_type.startswith("text/"):
-        return _extract_text_from_plain_bytes(content), _normalize_doc_kind(item.filename, item.docType)
+        text = _extract_text_from_plain_bytes(content)
+        return text, _detect_doc_kind_from_text(text, fallback_kind)
+    if filename.endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")) or mime_type.startswith("image/"):
+        text = _extract_text_from_image_bytes(content)
+        return text, _detect_doc_kind_from_text(text, fallback_kind)
 
-    return "", _normalize_doc_kind(item.filename, item.docType)
+    return "", fallback_kind
 
 
 def _validate_water_purpose(value: str) -> list[str]:
@@ -336,6 +370,7 @@ def _extract_business_license_fields(text: str) -> dict[str, str]:
     company_name = _extract_with_patterns(
         text,
         [
+            r"名\s*称[:：\s]*([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,80})",
             r"(?:企业名称|名称)[:：\s]*([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,80})",
         ],
     )

@@ -12,6 +12,22 @@ def knowledge_search(query: str, top_k: int = 3) -> dict:
     return {"results": results}
 
 
+def ingest_knowledge_file(filename: str, content: bytes) -> dict:
+    return kb.ingest_file(filename, content)
+
+
+def knowledge_documents() -> dict:
+    return kb.list_documents()
+
+
+def delete_knowledge_document(doc_id: str) -> dict:
+    return kb.delete_document(doc_id)
+
+
+def vector_visualization(limit: int = 120) -> dict:
+    return kb.vector_points(limit)
+
+
 def check_completeness(materials: list[str]) -> dict:
     missing = [item for item in REQUIRED_MATERIALS if item not in materials]
     return {

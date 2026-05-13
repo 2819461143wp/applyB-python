@@ -6,3 +6,9 @@ httpx==0.28.1
 chromadb==0.5.23
 langchain==0.3.13
 python-multipart==0.0.20
+numpy==1.26.4
+Pillow==11.3.0
+opencv-python==4.10.0.84
+rapidocr-onnxruntime==1.4.4
+# Optional: install MinerU in the FastAPI environment to enable admin knowledge-base parsing.
+# mineru
